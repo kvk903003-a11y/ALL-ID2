@@ -3,129 +3,134 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import ta
-import plotly.graph_objects as go
+import pytz
+from datetime import datetime
 from streamlit_autorefresh import st_autorefresh
-import os
 
-# --- PAGE SETUP ---
-st.set_page_config(page_title="1-Min Multi-Exchange Intraday Engine", layout="wide")
-st.title("🌎 1-Min Multi-Exchange Intraday Engine (TSX/NASDAQ/NYSE)")
+# ---------------- SETTINGS ----------------
+TOP_N = 50
+TAKE_PROFIT = 1.01
+STOP_LOSS = 0.995
+MAX_POSITIONS = 10
 
-# --- SETTINGS ---
-INITIAL_CAPITAL = 100000
-TOP_N = 5
-STOP_LOSS = 0.5
-TAKE_PROFIT = 1.0
-TRAILING_STOP = True
+st.set_page_config(layout="wide")
+st.title("📊 Advanced Personal Trading Dashboard")
 
-# --- SESSION STATE ---
-if "equity_curve" not in st.session_state:
-    st.session_state.equity_curve = [INITIAL_CAPITAL]
-if "capital" not in st.session_state:
-    st.session_state.capital = INITIAL_CAPITAL
-if "positions" not in st.session_state:
-    st.session_state.positions = {}
+# ---------------- TIME ----------------
+def est_time():
+    est = pytz.timezone("America/New_York")
+    return datetime.now(est)
 
-# --- AUTO REFRESH EVERY 1 MINUTE ---
-st_autorefresh(interval=60*1000, key="datarefresh")
+def market_session():
+    now = est_time()
+    minutes = now.hour * 60 + now.minute
+    if 240 <= minutes < 570:
+        return "Pre-Market"
+    elif 570 <= minutes < 960:
+        return "Regular"
+    elif 960 <= minutes < 1200:
+        return "After-Hours"
+    else:
+        return "Closed"
 
-# --- SAFE CSV LOADING ---
-def load_csv(path):
-    if not os.path.exists(path):
-        st.error(f"CSV file not found: {path}")
-        return pd.DataFrame(columns=["Symbol","Name"])
-    try:
-        df = pd.read_csv(path)
-        if df.empty:
-            st.error(f"CSV file is empty: {path}")
-        return df
-    except Exception as e:
-        st.error(f"Error reading CSV {path}: {e}")
-        return pd.DataFrame(columns=["Symbol","Name"])
+st.markdown(f"### 🕒 EST Time: {est_time().strftime('%Y-%m-%d %H:%M:%S')}")
+st.markdown(f"📊 US Market Session: **{market_session()}**")
+st.markdown(f"⚙ Max Open Positions: {MAX_POSITIONS}")
 
-TSX = load_csv("data/tsx_tickers.csv")["Symbol"].tolist()
-NASDAQ = load_csv("data/nasdaq_tickers.csv")["Symbol"].tolist()
-NYSE = load_csv("data/nyse_tickers.csv")["Symbol"].tolist()
-stocks = {"TSX": TSX, "NASDAQ": NASDAQ, "NYSE": NYSE}
+st_autorefresh(interval=60*1000, key="refresh")
 
-# --- SIGNAL FUNCTION ---
-def generate_signal(df):
-    if len(df) < 30:
-        return 0, None, 0, df
-    df["EMA10"] = ta.trend.ema_indicator(df["Close"],10)
-    df["EMA30"] = ta.trend.ema_indicator(df["Close"],30)
-    df["RSI7"] = ta.momentum.rsi(df["Close"],7)
-    last = df.iloc[-1]
-    signal = 0
-    score = 0
-    if last["EMA10"]>last["EMA30"] and last["RSI7"]<70:
-        signal = 1
-        score = ((last["EMA10"]-last["EMA30"])/last["EMA30"])*100 + (70-last["RSI7"])
-    elif last["EMA10"]<last["EMA30"] and last["RSI7"]>30:
-        signal = -1
-        score = ((last["EMA30"]-last["EMA10"])/last["EMA10"])*100 + (last["RSI7"]-30)
-    return signal, last["Close"], score, df
+# ---------------- MARKET FILTERS ----------------
+@st.cache_data(ttl=300)
+def get_index_trend(symbol):
+    df = yf.download(symbol, period="6mo", interval="1d", progress=False)
+    df["EMA200"] = ta.trend.ema_indicator(df["Close"], 200)
+    return df.iloc[-1]["Close"] > df.iloc[-1]["EMA200"]
 
-# --- FETCH DATA ---
-def fetch_data(ticker):
-    try:
-        df = yf.download(ticker, period="7d", interval="1m", progress=False)
-        if df.empty:
-            df = yf.download(ticker, period="60d", interval="1d", progress=False)
-        if isinstance(df.columns,pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        return df
-    except:
-        return pd.DataFrame()
+spy_bull = get_index_trend("SPY")
+tsx_bull = get_index_trend("^GSPTSE")
 
-# --- MAIN LOGIC ---
-exchange_results = {}
-for exchange, tickers in stocks.items():
+st.markdown(f"🇺🇸 SPY Trend: {'Bullish' if spy_bull else 'Bearish'}")
+st.markdown(f"🇨🇦 TSX Trend: {'Bullish' if tsx_bull else 'Bearish'}")
+
+# ---------------- LOAD TICKERS ----------------
+TSX = pd.read_csv("data/tsx_tickers.csv")["Symbol"].tolist()[:50]
+NASDAQ = pd.read_csv("data/nasdaq_tickers.csv")["Symbol"].tolist()[:50]
+NYSE = pd.read_csv("data/nyse_tickers.csv")["Symbol"].tolist()[:50]
+
+# ---------------- BATCH DOWNLOAD ----------------
+@st.cache_data(ttl=55)
+def download_batch(tickers):
+    return yf.download(
+        tickers=tickers,
+        period="5d",
+        interval="1m",
+        group_by="ticker",
+        threads=True,
+        progress=False
+    )
+
+# ---------------- SIGNAL ENGINE ----------------
+def analyze_exchange(tickers, regime_bull):
+    data = download_batch(tickers)
     results = []
+
     for ticker in tickers:
-        df = fetch_data(ticker)
-        if df.empty:
-            continue
-        signal, price, score, df = generate_signal(df)
-        if price is None:
-            continue
-        results.append({"Stock":ticker,"Signal":signal,"Price":price,"Score":score,"DF":df})
-    exchange_results[exchange] = pd.DataFrame(results)
+        try:
+            df = data[ticker].dropna()
+            if len(df) < 50:
+                continue
 
-# --- DISPLAY TABS ---
+            df["EMA10"] = ta.trend.ema_indicator(df["Close"],10)
+            df["EMA30"] = ta.trend.ema_indicator(df["Close"],30)
+            df["RSI"] = ta.momentum.rsi(df["Close"],14)
+            df["VOL_MA"] = df["Volume"].rolling(20).mean()
+
+            last = df.iloc[-1]
+
+            if not regime_bull:
+                continue
+
+            if (
+                last["EMA10"] > last["EMA30"] and
+                45 < last["RSI"] < 65 and
+                last["Volume"] > last["VOL_MA"]
+            ):
+                score = (
+                    (last["EMA10"] - last["EMA30"]) / last["EMA30"] * 100 +
+                    (65 - abs(55 - last["RSI"]))
+                )
+
+                buy = last["Close"]
+                sell = buy * TAKE_PROFIT
+                stop = buy * STOP_LOSS
+
+                results.append({
+                    "Ticker": ticker,
+                    "Buy Price": round(buy,2),
+                    "Sell Price": round(sell,2),
+                    "Stop Price": round(stop,2),
+                    "Score": round(score,2)
+                })
+        except:
+            continue
+
+    df_result = pd.DataFrame(results)
+    if not df_result.empty:
+        df_result = df_result.sort_values("Score", ascending=False)
+        df_result.insert(0, "Rank", range(1, len(df_result)+1))
+    return df_result
+
+# ---------------- DISPLAY ----------------
 tabs = st.tabs(["TSX","NASDAQ","NYSE"])
-for i, exchange in enumerate(["TSX","NASDAQ","NYSE"]):
-    with tabs[i]:
-        df = exchange_results[exchange]
-        if df.empty:
-            st.warning(f"No intraday data for {exchange}.")
-            continue
 
-        # --- TOP BUY SIGNALS ---
-        buy_signals = df[df["Signal"]==1].sort_values(by="Score",ascending=False).head(TOP_N)
-        table_data = []
-        for _, row in buy_signals.iterrows():
-            buy_price = row["Price"]
-            sell_price = buy_price*(1+TAKE_PROFIT/100)
-            table_data.append({"Stock":row["Stock"],"Buy Price":round(buy_price,2),
-                               "Sell Price":round(sell_price,2),"Score":round(row["Score"],2)})
-        st.subheader(f"🏆 Top {TOP_N} Buy Signals - {exchange}")
-        st.dataframe(pd.DataFrame(table_data))
+with tabs[0]:
+    st.subheader("🇨🇦 TSX Ranked Signals")
+    st.dataframe(analyze_exchange(TSX, tsx_bull))
 
-        # --- CHARTS ---
-        st.subheader(f"📊 Charts - {exchange}")
-        for _, row in buy_signals.iterrows():
-            ticker = row["Stock"]
-            df_c = row["DF"]
-            fig = go.Figure()
-            if df_c.index.freqstr=="1T":
-                fig.add_trace(go.Candlestick(x=df_c.index, open=df_c["Open"], high=df_c["High"],
-                                             low=df_c["Low"], close=df_c["Close"], name="Price"))
-            else:
-                fig.add_trace(go.Scatter(x=df_c.index, y=df_c["Close"], mode="lines", name="Close"))
-            fig.add_trace(go.Scatter(x=df_c.index, y=df_c["EMA10"], mode="lines", name="EMA10"))
-            fig.add_trace(go.Scatter(x=df_c.index, y=df_c["EMA30"], mode="lines", name="EMA30"))
-            fig.update_layout(xaxis_rangeslider_visible=False, height=500, title=ticker)
-            st.plotly_chart(fig, use_container_width=True)
+with tabs[1]:
+    st.subheader("🇺🇸 NASDAQ Ranked Signals")
+    st.dataframe(analyze_exchange(NASDAQ, spy_bull))
 
-st.info("Dashboard auto-refreshes every 1 minute.")
+with tabs[2]:
+    st.subheader("🇺🇸 NYSE Ranked Signals")
+    st.dataframe(analyze_exchange(NYSE, spy_bull))
