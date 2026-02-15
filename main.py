@@ -3,8 +3,9 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import ta
-import time
 import plotly.graph_objects as go
+from streamlit_autorefresh import st_autorefresh
+import os
 
 # --- PAGE SETUP ---
 st.set_page_config(page_title="1-Min Multi-Exchange Intraday Engine", layout="wide")
@@ -16,7 +17,6 @@ TOP_N = 5
 STOP_LOSS = 0.5
 TAKE_PROFIT = 1.0
 TRAILING_STOP = True
-REFRESH_INTERVAL = 60  # seconds
 
 # --- SESSION STATE ---
 if "equity_curve" not in st.session_state:
@@ -25,13 +25,27 @@ if "capital" not in st.session_state:
     st.session_state.capital = INITIAL_CAPITAL
 if "positions" not in st.session_state:
     st.session_state.positions = {}
-if "alerts" not in st.session_state:
-    st.session_state.alerts = []
 
-# --- LOAD TICKERS ---
-TSX = pd.read_csv("data/tsx_tickers.csv")["Symbol"].tolist()
-NASDAQ = pd.read_csv("data/nasdaq_tickers.csv")["Symbol"].tolist()
-NYSE = pd.read_csv("data/nyse_tickers.csv")["Symbol"].tolist()
+# --- AUTO REFRESH EVERY 1 MINUTE ---
+st_autorefresh(interval=60*1000, key="datarefresh")
+
+# --- SAFE CSV LOADING ---
+def load_csv(path):
+    if not os.path.exists(path):
+        st.error(f"CSV file not found: {path}")
+        return pd.DataFrame(columns=["Symbol","Name"])
+    try:
+        df = pd.read_csv(path)
+        if df.empty:
+            st.error(f"CSV file is empty: {path}")
+        return df
+    except Exception as e:
+        st.error(f"Error reading CSV {path}: {e}")
+        return pd.DataFrame(columns=["Symbol","Name"])
+
+TSX = load_csv("data/tsx_tickers.csv")["Symbol"].tolist()
+NASDAQ = load_csv("data/nasdaq_tickers.csv")["Symbol"].tolist()
+NYSE = load_csv("data/nyse_tickers.csv")["Symbol"].tolist()
 stocks = {"TSX": TSX, "NASDAQ": NASDAQ, "NYSE": NYSE}
 
 # --- SIGNAL FUNCTION ---
@@ -52,7 +66,7 @@ def generate_signal(df):
         score = ((last["EMA30"]-last["EMA10"])/last["EMA10"])*100 + (last["RSI7"]-30)
     return signal, last["Close"], score, df
 
-# --- FETCH DATA FUNCTION ---
+# --- FETCH DATA ---
 def fetch_data(ticker):
     try:
         df = yf.download(ticker, period="7d", interval="1m", progress=False)
@@ -64,10 +78,10 @@ def fetch_data(ticker):
     except:
         return pd.DataFrame()
 
-# --- MAIN LOOP ---
+# --- MAIN LOGIC ---
 exchange_results = {}
 for exchange, tickers in stocks.items():
-    results=[]
+    results = []
     for ticker in tickers:
         df = fetch_data(ticker)
         if df.empty:
@@ -78,7 +92,7 @@ for exchange, tickers in stocks.items():
         results.append({"Stock":ticker,"Signal":signal,"Price":price,"Score":score,"DF":df})
     exchange_results[exchange] = pd.DataFrame(results)
 
-# --- CREATE TABS ---
+# --- DISPLAY TABS ---
 tabs = st.tabs(["TSX","NASDAQ","NYSE"])
 for i, exchange in enumerate(["TSX","NASDAQ","NYSE"]):
     with tabs[i]:
@@ -86,7 +100,8 @@ for i, exchange in enumerate(["TSX","NASDAQ","NYSE"]):
         if df.empty:
             st.warning(f"No intraday data for {exchange}.")
             continue
-        # --- Top Buy Signals ---
+
+        # --- TOP BUY SIGNALS ---
         buy_signals = df[df["Signal"]==1].sort_values(by="Score",ascending=False).head(TOP_N)
         table_data = []
         for _, row in buy_signals.iterrows():
@@ -97,12 +112,12 @@ for i, exchange in enumerate(["TSX","NASDAQ","NYSE"]):
         st.subheader(f"🏆 Top {TOP_N} Buy Signals - {exchange}")
         st.dataframe(pd.DataFrame(table_data))
 
-        # --- Charts ---
+        # --- CHARTS ---
         st.subheader(f"📊 Charts - {exchange}")
         for _, row in buy_signals.iterrows():
-            ticker=row["Stock"]
-            df_c=row["DF"]
-            fig=go.Figure()
+            ticker = row["Stock"]
+            df_c = row["DF"]
+            fig = go.Figure()
             if df_c.index.freqstr=="1T":
                 fig.add_trace(go.Candlestick(x=df_c.index, open=df_c["Open"], high=df_c["High"],
                                              low=df_c["Low"], close=df_c["Close"], name="Price"))
@@ -113,7 +128,4 @@ for i, exchange in enumerate(["TSX","NASDAQ","NYSE"]):
             fig.update_layout(xaxis_rangeslider_visible=False, height=500, title=ticker)
             st.plotly_chart(fig, use_container_width=True)
 
-# --- REFRESH EVERY 1 MIN ---
-st.info(f"Refreshing every {REFRESH_INTERVAL} seconds...")
-time.sleep(REFRESH_INTERVAL)
-st.experimental_rerun()
+st.info("Dashboard auto-refreshes every 1 minute.")
